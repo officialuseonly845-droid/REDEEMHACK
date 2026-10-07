@@ -2,6 +2,7 @@ import os
 import re
 import json
 import html
+import asyncio
 import logging
 import threading
 from datetime import datetime, timezone, timedelta
@@ -69,7 +70,7 @@ def _load() -> dict:
         return {"groups": {}}
     groups = d.get("groups", {})
     old_targets = d.pop("targets", [])  # migrate old global targets
-    for gid, g in groups.items():
+    for gid, g in list(groups.items()):
         base = new_group(g.get("title", gid), g.get("type", "group"), g.get("admin", False))
         base.update(g)
         if "targets" not in g:
@@ -403,7 +404,7 @@ async def cmd_g(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await msg.reply_text(panel_text(str(chat.id)), reply_markup=panel_markup(str(chat.id)))
 
 
-def selected(context) -> str | None:
+def selected(context):
     sel = context.user_data.get("sel")
     return sel if sel in GROUPS else None
 
@@ -543,6 +544,10 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, f"{note}\n\n{list_text(mode)}", list_markup(mode))
 
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
+    log.error("Handler error: %s", context.error, exc_info=context.error)
+
+
 # ---------------------------------------------------------------- startup refresh
 async def post_init(app: Application):
     """After every restart: re-verify remembered groups and refresh admin status."""
@@ -563,9 +568,11 @@ async def post_init(app: Application):
             log.warning("Could not verify group %s: %s", gid, e)
     log.info("Groups loaded: %d", len(GROUPS))
     try:
-        await app.bot.send_message(OWNER_ID, f"✅ Bot online. Remembered groups: {len(GROUPS)}\nSend /groups to manage.")
-    except Exception:
-        pass
+        await app.bot.send_message(
+            OWNER_ID, f"✅ Bot online. Remembered groups: {len(GROUPS)}\nSend /start for the guide."
+        )
+    except Exception as e:
+        log.warning("Could not DM owner on startup (press Start on the bot first): %s", e)
 
 
 # ---------------------------------------------------------------- flask health
@@ -603,6 +610,10 @@ def main():
     app.add_handler(
         MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION), on_group_message)
     )
+    app.add_error_handler(on_error)
+
+    # Python 3.14 fix: polling needs an event loop to exist in the main thread
+    asyncio.set_event_loop(asyncio.new_event_loop())
 
     log.info("Bot started.")
     app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
