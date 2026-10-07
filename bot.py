@@ -65,9 +65,9 @@ def _load() -> dict:
         with open(DATA_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
     except (FileNotFoundError, json.JSONDecodeError):
-        return {"groups": {}}
+        return {"groups": {}, "users": []}
     if not isinstance(d, dict):
-        return {"groups": {}}
+        return {"groups": {}, "users": []}
     groups = d.get("groups", {})
     old_targets = d.pop("targets", [])  # migrate old global targets
     for gid, g in list(groups.items()):
@@ -76,18 +76,28 @@ def _load() -> dict:
         if "targets" not in g:
             base["targets"] = list(old_targets)
         groups[gid] = base
-    return {"groups": groups}
+    users = [int(u) for u in d.get("users", []) if str(u).lstrip("-").isdigit()]
+    return {"groups": groups, "users": users}
 
 
 def _save() -> None:
-    tmp = DATA_FILE + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(DATA, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, DATA_FILE)
+    with _lock:
+        tmp = DATA_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(DATA, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, DATA_FILE)
 
 
 DATA = _load()
 GROUPS: dict = DATA["groups"]
+USERS: list = DATA["users"]            # extra users added with /add
+AUTH_IDS: set = {OWNER_ID, *USERS}     # everyone allowed to use the bot
+
+
+def refresh_auth() -> None:
+    AUTH_IDS.clear()
+    AUTH_IDS.add(OWNER_ID)
+    AUTH_IDS.update(USERS)
 
 
 def remember_group(chat_id: int, title: str, ctype: str, admin=None) -> None:
@@ -114,6 +124,24 @@ def forget_group(chat_id: int) -> None:
         if GROUPS.pop(str(chat_id), None) is not None:
             _save()
 
+
+# ---------------------------------------------------------------- filters
+class AuthFilter(filters.MessageFilter):
+    """Passes only messages from the owner or users added with /add."""
+    def filter(self, message):
+        u = message.from_user
+        return bool(u and u.id in AUTH_IDS)
+
+
+class OwnerFilter(filters.MessageFilter):
+    def filter(self, message):
+        u = message.from_user
+        return bool(u and u.id == OWNER_ID)
+
+
+PRIVATE = filters.ChatType.PRIVATE
+AUTH_DM = PRIVATE & AuthFilter()
+OWNER_DM = PRIVATE & OwnerFilter()
 
 # ---------------------------------------------------------------- targets (per group)
 def parse_target(token: str):
@@ -144,15 +172,13 @@ def match_target(user, targets: list) -> bool:
     for t in targets:
         if t.get("id") and t["id"] == user.id:
             if uname and t.get("username") != uname:
-                with _lock:
-                    t["username"] = uname
-                    _save()
+                t["username"] = uname
+                threading.Thread(target=_save, daemon=True).start()
             return True
         if t.get("username") and uname and t["username"] == uname:
             if not t.get("id"):
-                with _lock:
-                    t["id"] = user.id
-                    _save()
+                t["id"] = user.id
+                threading.Thread(target=_save, daemon=True).start()
             return True
     return False
 
@@ -180,6 +206,8 @@ REDEEM_URL_RE = re.compile(r"play\.google\.com/redeem\?[^\s]*?code=([A-Z0-9\-]{1
 ANY_URL_RE = re.compile(r"(?:https?://|www\.)\S+", re.I)
 DASHED_RE = re.compile(r"(?<![A-Z0-9])([A-Z0-9]{4}(?:-[A-Z0-9]{4}){3,5})(?![A-Z0-9])")
 PLAIN_RE = re.compile(r"(?<![A-Z0-9])([A-Z0-9]{16,24})(?![A-Z0-9])")
+HAS_LETTER = re.compile(r"[A-Z]")
+HAS_DIGIT = re.compile(r"\d")
 
 GP_LENGTHS = {16, 20, 23, 24}
 GP_HINTS = ("google play", "googleplay", "gplay", "g play", "play.google", "play store", "playstore")
@@ -187,7 +215,7 @@ OTHER_HINTS = ("swiggy", "phonepe", "phone pe", "paytm", "zomato", "amazon pay",
 
 
 def extract_google_play_codes(text: str) -> list:
-    if not text:
+    if not text or len(text) < 12:      # fast exit: too short to hold a code
         return []
     text = text.translate(ZERO_WIDTH)
     low = text.lower()
@@ -208,7 +236,7 @@ def extract_google_play_codes(text: str) -> list:
         add(m.group(1))
     for m in PLAIN_RE.finditer(stripped):
         c = m.group(1)
-        if re.search(r"[A-Z]", c) and re.search(r"\d", c):
+        if HAS_LETTER.search(c) and HAS_DIGIT.search(c):
             add(c)
     return found
 
@@ -294,11 +322,11 @@ async def safe_edit(q, text, markup=None):
             raise
 
 
-START_TEXT = (
-    "🤖 Google Play Code Watcher — Owner Panel\n\n"
-    "How it works: I silently watch the groups I'm in. When a Google Play code appears, "
+START_BASE = (
+    "🤖 Google Play Code Watcher\n\n"
+    "I silently watch the groups I'm in. When a Google Play code appears, "
     "I DM you a REDEEM NOW button. I never post in groups.\n\n"
-    "📌 Commands (owner DM only)\n"
+    "📌 Commands\n"
     "/start – this guide\n"
     "/groups – list groups; tap one to see its panel (targets, stats, pause, leave)\n"
     "/rgroup – list groups with quick Leave buttons\n"
@@ -306,54 +334,70 @@ START_TEXT = (
     "/target @user – track only this user in the opened group\n"
     "/untarget @user – stop tracking that user in the opened group\n"
     "/targets – show targets of the opened group\n"
-    "/target off – clear targets (track everyone) in the opened group\n\n"
-    "🔁 Workflow: /groups → tap a group → use the buttons. "
-    "Targets are saved per group."
+    "/target off – clear targets (track everyone) in the opened group\n"
 )
+START_OWNER = (
+    "\n👑 Owner only\n"
+    "/add USER_ID – give someone access to this bot\n"
+    "/remove USER_ID – remove their access\n"
+    "/users – list everyone with access\n"
+)
+START_FOOT = "\n🔁 Workflow: /groups → tap a group → use the buttons. Targets are saved per group."
 
 
 # ---------------------------------------------------------------- monitoring
+async def send_alert(bot, uid: int, text: str, markup):
+    try:
+        await bot.send_message(
+            chat_id=uid, text=text, parse_mode=ParseMode.HTML,
+            reply_markup=markup, disable_web_page_preview=True,
+        )
+    except Exception as e:
+        log.error("Alert to %s failed: %s", uid, e)
+
+
 async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     msg, chat = update.effective_message, update.effective_chat
     if not msg or not chat:
         return
 
     key = str(chat.id)
-    if key not in GROUPS:
+    g = GROUPS.get(key)
+    if g is None:
         remember_group(chat.id, chat.title or key, chat.type)
-    g = GROUPS[key]
+        g = GROUPS[key]
 
     if not g["active"]:
         return
     if g["targets"] and not match_target(msg.from_user, g["targets"]):
         return
 
-    parts = [msg.text or "", msg.caption or ""]
-    for ent in list(msg.entities or []) + list(msg.caption_entities or []):
-        if ent.url:
-            parts.append(ent.url)
-    text = "\n".join(p for p in parts if p)
+    text = msg.text or msg.caption or ""
+    ents = msg.entities or msg.caption_entities
+    if ents:
+        extra = [e.url for e in ents if e.url]
+        if extra:
+            text = text + "\n" + "\n".join(extra)
 
-    for code in extract_google_play_codes(text):
+    codes = extract_google_play_codes(text)
+    if not codes:
+        return
+
+    for code in codes:
         if not is_new(code):
             continue
-        with _lock:
-            g["codes"] += 1
-            g["last_code"], g["last_time"] = code, now_ts()
-            _save()
         url = f"https://play.google.com/redeem?code={code}"
         markup = InlineKeyboardMarkup([[InlineKeyboardButton("🚀 REDEEM NOW", url=url)]])
-        try:
-            await context.bot.send_message(
-                chat_id=OWNER_ID,
-                text=(f"🚨 GOOGLE PLAY CODE FOUND\n🎟 <code>{code}</code>\n"
-                      f"📍 {html.escape(short(g['title'], 40))}"),
-                parse_mode=ParseMode.HTML,
-                reply_markup=markup,
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            log.error("Failed to DM owner: %s", e)
+        body = (f"🚨 GOOGLE PLAY CODE FOUND\n🎟 <code>{code}</code>\n"
+                f"📍 {html.escape(short(g['title'], 40))}")
+
+        # 1) send to everyone at the same time
+        await asyncio.gather(*(send_alert(context.bot, uid, body, markup) for uid in list(AUTH_IDS)))
+
+        # 2) save stats after the alert is out, off the event loop
+        g["codes"] += 1
+        g["last_code"], g["last_time"] = code, now_ts()
+        asyncio.get_running_loop().run_in_executor(None, _save)
 
 
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -367,9 +411,11 @@ async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
         forget_group(chat.id)
 
 
-# ---------------------------------------------------------------- owner commands (DM only)
+# ---------------------------------------------------------------- commands (owner + added users, DM only)
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.effective_message.reply_text(START_TEXT)
+    is_owner = update.effective_user.id == OWNER_ID
+    text = START_BASE + (START_OWNER if is_owner else "") + START_FOOT
+    await update.effective_message.reply_text(text)
 
 
 async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -462,7 +508,7 @@ async def cmd_targets(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def on_owner_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Plain text from owner: only used after tapping 🎯 Set Target."""
+    """Plain text: only used right after tapping 🎯 Set Target."""
     gid = context.user_data.pop("pending", None)
     if not gid or gid not in GROUPS:
         return
@@ -473,9 +519,58 @@ async def on_owner_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(panel_text(gid), reply_markup=panel_markup(gid))
 
 
+# ---------------------------------------------------------------- owner-only: user access
+async def cmd_add(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not context.args or not context.args[0].isdigit():
+        await msg.reply_text("Usage: /add USER_ID\nExample: /add 123456789")
+        return
+    uid = int(context.args[0])
+    if uid == OWNER_ID:
+        await msg.reply_text("That's you, you already have full access.")
+        return
+    if uid in USERS:
+        await msg.reply_text(f"ℹ️ {uid} already has access.")
+        return
+    with _lock:
+        USERS.append(uid)
+        refresh_auth()
+        _save()
+    note = f"✅ Access granted to {uid}."
+    try:
+        await context.bot.send_message(
+            uid, "✅ You've been given access to this bot.\nSend /start to see the commands."
+        )
+    except Exception:
+        note += "\n⚠️ I couldn't message them yet. Ask them to open this bot and press Start once, then they'll receive alerts."
+    await msg.reply_text(note)
+
+
+async def cmd_remove(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    if not context.args or not context.args[0].isdigit():
+        await msg.reply_text("Usage: /remove USER_ID")
+        return
+    uid = int(context.args[0])
+    if uid not in USERS:
+        await msg.reply_text("That ID isn't in the access list.")
+        return
+    with _lock:
+        USERS.remove(uid)
+        refresh_auth()
+        _save()
+    await msg.reply_text(f"🗑 Access removed for {uid}.")
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    lines = [f"👑 {OWNER_ID} (owner)"] + [f"👤 {u}" for u in USERS]
+    await update.effective_message.reply_text("🔐 Users with access:\n" + "\n".join(lines))
+
+
+# ---------------------------------------------------------------- buttons
 async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
-    if not q or not q.from_user or q.from_user.id != OWNER_ID:
+    if not q or not q.from_user or q.from_user.id not in AUTH_IDS:
         return
     if not q.message or q.message.chat.type != ChatType.PRIVATE:
         return
@@ -551,12 +646,12 @@ async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
 # ---------------------------------------------------------------- startup refresh
 async def post_init(app: Application):
     """After every restart: re-verify remembered groups and refresh admin status."""
-    for gid in list(GROUPS):
+    async def verify(gid: str):
         try:
             me = await app.bot.get_chat_member(int(gid), app.bot.id)
             if not is_member_status(me):
                 forget_group(int(gid))
-                continue
+                return
             chat = await app.bot.get_chat(int(gid))
             remember_group(
                 chat.id, chat.title or gid, chat.type,
@@ -566,7 +661,9 @@ async def post_init(app: Application):
             forget_group(int(gid))
         except Exception as e:
             log.warning("Could not verify group %s: %s", gid, e)
-    log.info("Groups loaded: %d", len(GROUPS))
+
+    await asyncio.gather(*(verify(gid) for gid in list(GROUPS)))   # all groups checked in parallel
+    log.info("Groups loaded: %d | Users with access: %d", len(GROUPS), len(AUTH_IDS))
     try:
         await app.bot.send_message(
             OWNER_ID, f"✅ Bot online. Remembered groups: {len(GROUPS)}\nSend /start for the guide."
@@ -586,24 +683,39 @@ def health():
 
 def run_web():
     logging.getLogger("werkzeug").setLevel(logging.WARNING)
-    web.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
+    web.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
 
 
 # ---------------------------------------------------------------- main
 def main():
     threading.Thread(target=run_web, daemon=True).start()
 
-    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+    app = (
+        Application.builder()
+        .token(BOT_TOKEN)
+        .post_init(post_init)
+        .concurrent_updates(True)
+        .connection_pool_size(32)
+        .pool_timeout(5.0)
+        .connect_timeout(5.0)
+        .read_timeout(10.0)
+        .write_timeout(10.0)
+        .build()
+    )
 
-    owner_dm = filters.ChatType.PRIVATE & filters.User(user_id=OWNER_ID)
-    app.add_handler(CommandHandler("start", cmd_start, filters=owner_dm))
-    app.add_handler(CommandHandler("groups", cmd_groups, filters=owner_dm))
-    app.add_handler(CommandHandler("rgroup", cmd_rgroup, filters=owner_dm))
-    app.add_handler(CommandHandler("g", cmd_g, filters=owner_dm))
-    app.add_handler(CommandHandler("target", cmd_target, filters=owner_dm))
-    app.add_handler(CommandHandler("untarget", cmd_untarget, filters=owner_dm))
-    app.add_handler(CommandHandler("targets", cmd_targets, filters=owner_dm))
-    app.add_handler(MessageHandler(owner_dm & filters.TEXT & ~filters.COMMAND, on_owner_text))
+    app.add_handler(CommandHandler("start", cmd_start, filters=AUTH_DM))
+    app.add_handler(CommandHandler("groups", cmd_groups, filters=AUTH_DM))
+    app.add_handler(CommandHandler("rgroup", cmd_rgroup, filters=AUTH_DM))
+    app.add_handler(CommandHandler("g", cmd_g, filters=AUTH_DM))
+    app.add_handler(CommandHandler("target", cmd_target, filters=AUTH_DM))
+    app.add_handler(CommandHandler("untarget", cmd_untarget, filters=AUTH_DM))
+    app.add_handler(CommandHandler("targets", cmd_targets, filters=AUTH_DM))
+
+    app.add_handler(CommandHandler("add", cmd_add, filters=OWNER_DM))
+    app.add_handler(CommandHandler("remove", cmd_remove, filters=OWNER_DM))
+    app.add_handler(CommandHandler("users", cmd_users, filters=OWNER_DM))
+
+    app.add_handler(MessageHandler(AUTH_DM & filters.TEXT & ~filters.COMMAND, on_owner_text))
     app.add_handler(CallbackQueryHandler(on_callback))
 
     app.add_handler(ChatMemberHandler(on_my_chat_member, ChatMemberHandler.MY_CHAT_MEMBER))
@@ -612,11 +724,16 @@ def main():
     )
     app.add_error_handler(on_error)
 
-    # Python 3.14 fix: polling needs an event loop to exist in the main thread
+    # Python 3.14 fix: polling needs an event loop in the main thread
     asyncio.set_event_loop(asyncio.new_event_loop())
 
     log.info("Bot started.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    app.run_polling(
+        allowed_updates=["message", "my_chat_member", "callback_query"],
+        drop_pending_updates=True,
+        poll_interval=0.0,
+        timeout=30,
+    )
 
 
 if __name__ == "__main__":
