@@ -1,7 +1,9 @@
 import os
 import re
+import sys
 import json
 import html
+import time
 import asyncio
 import logging
 import threading
@@ -11,7 +13,7 @@ from collections import OrderedDict
 from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ChatMember
 from telegram.constants import ParseMode, ChatType
-from telegram.error import BadRequest, Forbidden
+from telegram.error import BadRequest, Forbidden, NetworkError, RetryAfter, Conflict
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -25,22 +27,28 @@ from telegram.ext import (
 logging.basicConfig(format="%(asctime)s | %(levelname)s | %(message)s", level=logging.INFO)
 log = logging.getLogger("gplay-bot")
 
-# ---------------------------------------------------------------- config
+# ---------------------------------------------------------------- config (only 2 env: BOT_TOKEN, OWNER_ID)
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 OWNER_ID_RAW = os.environ.get("OWNER_ID", "").strip()
-DATA_DIR = os.environ.get("DATA_DIR", ".").strip() or "."
-PORT = int(os.environ.get("PORT", "10000"))
+PORT = int(os.environ.get("PORT", "10000"))   # Render sets this automatically
 
 if not BOT_TOKEN or not OWNER_ID_RAW.lstrip("-").isdigit():
     raise SystemExit("BOT_TOKEN and numeric OWNER_ID environment variables are required.")
 OWNER_ID = int(OWNER_ID_RAW)
 
+# Render Disk at /data is used automatically if present, else current folder
+DATA_DIR = os.environ.get("DATA_DIR", "").strip() or (
+    "/data" if os.path.isdir("/data") and os.access("/data", os.W_OK) else "."
+)
 os.makedirs(DATA_DIR, exist_ok=True)
 DATA_FILE = os.path.join(DATA_DIR, "data.json")
 IST = timezone(timedelta(hours=5, minutes=30))
+STALE_SECONDS = 120          # messages older than this (replayed after restart) never trigger alerts
+BACKUP_PREFIX = "GPBACKUP:"
 
 # ---------------------------------------------------------------- storage
 _lock = threading.RLock()
+DIRTY = threading.Event()    # set whenever data changes -> triggers Telegram backup
 
 
 def now_ts() -> int:
@@ -86,6 +94,7 @@ def _save() -> None:
         with open(tmp, "w", encoding="utf-8") as f:
             json.dump(DATA, f, ensure_ascii=False, indent=2)
         os.replace(tmp, DATA_FILE)
+    DIRTY.set()
 
 
 DATA = _load()
@@ -142,6 +151,7 @@ class OwnerFilter(filters.MessageFilter):
 PRIVATE = filters.ChatType.PRIVATE
 AUTH_DM = PRIVATE & AuthFilter()
 OWNER_DM = PRIVATE & OwnerFilter()
+
 
 # ---------------------------------------------------------------- targets (per group)
 def parse_target(token: str):
@@ -330,11 +340,14 @@ START_BASE = (
     "/start – this guide\n"
     "/groups – list groups; tap one to see its panel (targets, stats, pause, leave)\n"
     "/rgroup – list groups with quick Leave buttons\n"
+    "/sync – re-check all remembered groups with Telegram (names, admin status, removed ones)\n"
     "/g GROUP_ID – register a group I'm already in (e.g. /g -828292991)\n"
     "/target @user – track only this user in the opened group\n"
     "/untarget @user – stop tracking that user in the opened group\n"
     "/targets – show targets of the opened group\n"
     "/target off – clear targets (track everyone) in the opened group\n"
+    "\n🔎 Groups are found automatically when I'm added, when a message arrives in them, "
+    "and from a pinned backup in the owner's DM after a redeploy.\n"
 )
 START_OWNER = (
     "\n👑 Owner only\n"
@@ -343,6 +356,147 @@ START_OWNER = (
     "/users – list everyone with access\n"
 )
 START_FOOT = "\n🔁 Workflow: /groups → tap a group → use the buttons. Targets are saved per group."
+
+
+# ---------------------------------------------------------------- group verification
+async def verify_group(bot, gid: str) -> str:
+    """Re-check one remembered group with Telegram. Returns 'ok' | 'removed' | 'error'."""
+    try:
+        me = await bot.get_chat_member(int(gid), bot.id)
+        if not is_member_status(me):
+            forget_group(int(gid))
+            return "removed"
+        chat = await bot.get_chat(int(gid))
+        remember_group(
+            chat.id, chat.title or gid, chat.type,
+            admin=me.status in (ChatMember.ADMINISTRATOR, ChatMember.OWNER),
+        )
+        return "ok"
+    except (Forbidden, BadRequest):
+        forget_group(int(gid))
+        return "removed"
+    except Exception as e:
+        log.warning("Could not verify group %s: %s", gid, e)
+        return "error"
+
+
+# ---------------------------------------------------------------- Telegram-side backup (pinned msg in owner DM)
+BACKUP_MID = None
+BACKUP_OK = False
+RESTORED = False
+
+
+def make_snapshot():
+    def build(full: bool) -> str:
+        gs = {}
+        for gid, g in GROUPS.items():
+            d = {
+                "a": int(bool(g.get("admin"))),
+                "o": int(bool(g.get("active", True))),
+                "tg": [[t.get("username"), t.get("id")] for t in g["targets"]],
+            }
+            if full:
+                d["t"] = (g.get("title") or gid)[:30]
+                d["c"] = g.get("codes", 0)
+            gs[gid] = d
+        return BACKUP_PREFIX + json.dumps({"g": gs, "u": USERS}, ensure_ascii=False, separators=(",", ":"))
+
+    s = build(True)
+    return s if len(s) <= 4000 else build(False)
+
+
+async def do_backup(bot):
+    global BACKUP_MID
+    if not GROUPS and not USERS:
+        return  # never overwrite a good backup with an empty one
+    text = make_snapshot()
+    if len(text) > 4096:
+        log.warning("Backup too large for one Telegram message (%d chars), skipped", len(text))
+        return
+    if BACKUP_MID:
+        try:
+            await bot.edit_message_text(text, chat_id=OWNER_ID, message_id=BACKUP_MID)
+            return
+        except BadRequest as e:
+            if "not modified" in str(e).lower():
+                return
+            log.info("Backup message missing, creating a new one: %s", e)
+    m = await bot.send_message(OWNER_ID, text, disable_notification=True)
+    BACKUP_MID = m.message_id
+    try:
+        await bot.pin_chat_message(OWNER_ID, m.message_id, disable_notification=True)
+    except Exception as e:
+        log.warning("Could not pin backup message: %s", e)
+
+
+async def backup_loop(app: Application):
+    while True:
+        await asyncio.sleep(20)
+        if DIRTY.is_set():
+            DIRTY.clear()
+            try:
+                await do_backup(app.bot)
+            except (NetworkError, RetryAfter) as e:
+                DIRTY.set()
+                log.warning("Backup postponed: %s", e)
+            except Exception as e:
+                log.warning("Backup failed: %s", e)
+
+
+async def restore_from_telegram(bot) -> bool:
+    """Looks for the pinned backup in the owner DM. Restores data if local data is empty.
+    Returns True if the lookup worked (so it is safe to start writing backups)."""
+    global BACKUP_MID, RESTORED
+    chat = None
+    for _ in range(3):
+        try:
+            chat = await bot.get_chat(OWNER_ID)
+            break
+        except (Forbidden, BadRequest) as e:
+            log.info("Owner DM not available yet (press Start on the bot): %s", e)
+            return True
+        except Exception as e:
+            log.warning("Backup lookup failed, retrying: %s", e)
+            await asyncio.sleep(2)
+    if chat is None:
+        return False
+
+    pm = chat.pinned_message
+    if not pm or not (pm.text or "").startswith(BACKUP_PREFIX):
+        return True
+    BACKUP_MID = pm.message_id
+    if GROUPS or USERS:
+        return True  # local data exists, keep it
+
+    try:
+        data = json.loads(pm.text[len(BACKUP_PREFIX):])
+    except Exception as e:
+        log.warning("Backup message unreadable: %s", e)
+        return True
+
+    with _lock:
+        for gid, d in (data.get("g") or {}).items():
+            if not str(gid).lstrip("-").isdigit():
+                continue
+            g = new_group(d.get("t") or str(gid), "supergroup", d.get("a"))
+            g["active"] = bool(d.get("o", 1))
+            g["codes"] = int(d.get("c", 0))
+            tl = []
+            for pair in d.get("tg", []):
+                try:
+                    u, i = pair
+                except Exception:
+                    continue
+                if u or i:
+                    tl.append({"username": u, "id": i})
+            g["targets"] = tl
+            GROUPS[str(gid)] = g
+        USERS[:] = [int(u) for u in (data.get("u") or []) if str(u).lstrip("-").isdigit()]
+        refresh_auth()
+        _save()
+    RESTORED = True
+    log.info("Restored %d groups and %d users from Telegram backup", len(GROUPS), len(USERS))
+    return True
 
 
 # ---------------------------------------------------------------- monitoring
@@ -366,6 +520,10 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if g is None:
         remember_group(chat.id, chat.title or key, chat.type)
         g = GROUPS[key]
+
+    # old message replayed after a restart: group is remembered, but no alert for stale codes
+    if msg.date and (datetime.now(timezone.utc) - msg.date).total_seconds() > STALE_SECONDS:
+        return
 
     if not g["active"]:
         return
@@ -402,13 +560,48 @@ async def on_group_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def on_my_chat_member(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ev = update.my_chat_member
-    if not ev or ev.chat.type == ChatType.PRIVATE:
+    if not ev:
         return
-    chat, st = ev.chat, ev.new_chat_member.status
+    chat = ev.chat
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+
+    st = ev.new_chat_member.status
+    key = str(chat.id)
+    who = ev.from_user
+    by = "unknown"
+    if who:
+        by = f"@{who.username}" if who.username else who.full_name
+        by += f" (ID {who.id})"
+
     if st in (ChatMember.MEMBER, ChatMember.ADMINISTRATOR):
-        remember_group(chat.id, chat.title or str(chat.id), chat.type, admin=(st == ChatMember.ADMINISTRATOR))
+        is_admin = st == ChatMember.ADMINISTRATOR
+        existed = key in GROUPS
+        was_admin = GROUPS[key].get("admin") if existed else None
+        remember_group(chat.id, chat.title or key, chat.type, admin=is_admin)
+        if not existed or was_admin != is_admin:
+            head = "➕ New group found" if not existed else "🔄 Role changed"
+            try:
+                await context.bot.send_message(
+                    OWNER_ID,
+                    f"{head}\n👥 {chat.title or key}\n🆔 {chat.id}\n"
+                    f"👤 Bot role: {'Admin ⭐' if is_admin else 'Member'}\n🙋 By: {by}\n\n"
+                    f"Open it: /groups",
+                )
+            except Exception as e:
+                log.warning("Could not notify owner: %s", e)
+
     elif st in (ChatMember.LEFT, ChatMember.BANNED):
+        title = GROUPS.get(key, {}).get("title") or chat.title or key
+        existed = key in GROUPS
         forget_group(chat.id)
+        if existed:
+            try:
+                await context.bot.send_message(
+                    OWNER_ID, f"➖ Bot removed from group\n👥 {title}\n🆔 {chat.id}\n🙋 By: {by}"
+                )
+            except Exception as e:
+                log.warning("Could not notify owner: %s", e)
 
 
 # ---------------------------------------------------------------- commands (owner + added users, DM only)
@@ -424,6 +617,24 @@ async def cmd_groups(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def cmd_rgroup(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.effective_message.reply_text(list_text("r"), reply_markup=list_markup("r"))
+
+
+async def cmd_sync(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    msg = update.effective_message
+    wait = await msg.reply_text("🔄 Telegram se groups check ho rahe hain...")
+    ids = list(GROUPS)
+    results = await asyncio.gather(*(verify_group(context.bot, gid) for gid in ids))
+    removed, errors = results.count("removed"), results.count("error")
+    DIRTY.set()
+    await wait.edit_text(
+        "✅ Sync done\n"
+        f"📋 Groups now: {len(GROUPS)}\n"
+        f"🗑 Removed (bot ab member nahi): {removed}\n"
+        f"⚠️ Check fail (baad mein dobara try karo): {errors}\n\n"
+        "Naya group tab milta hai jab bot add ho ya group mein koi message aaye. "
+        "Kisi bilkul chup group ke liye /g GROUP_ID use karo.\n\n"
+        "Open: /groups"
+    )
 
 
 async def cmd_g(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -639,37 +850,77 @@ async def on_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit(q, f"{note}\n\n{list_text(mode)}", list_markup(mode))
 
 
+# ---------------------------------------------------------------- global error handling
+_last_alert = 0.0
+
+
 async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE):
-    log.error("Handler error: %s", context.error, exc_info=context.error)
-
-
-# ---------------------------------------------------------------- startup refresh
-async def post_init(app: Application):
-    """After every restart: re-verify remembered groups and refresh admin status."""
-    async def verify(gid: str):
+    """Handler-level errors: temporary ones are only logged, real ones DM the owner (max 1 per 5 min)."""
+    global _last_alert
+    err = context.error
+    if isinstance(err, (NetworkError, RetryAfter)):
+        log.warning("Temporary Telegram/network error: %s", err)
+        return
+    if isinstance(err, Conflict):
+        log.error("Conflict: same BOT_TOKEN pe doosra instance chal raha hai!")
+        return
+    log.error("Handler error: %s", err, exc_info=err)
+    now = time.time()
+    if now - _last_alert > 300:
+        _last_alert = now
         try:
-            me = await app.bot.get_chat_member(int(gid), app.bot.id)
-            if not is_member_status(me):
-                forget_group(int(gid))
-                return
-            chat = await app.bot.get_chat(int(gid))
-            remember_group(
-                chat.id, chat.title or gid, chat.type,
-                admin=me.status in (ChatMember.ADMINISTRATOR, ChatMember.OWNER),
+            await context.bot.send_message(
+                OWNER_ID, f"⚠️ Bot error: {type(err).__name__}: {str(err)[:200]}"
             )
-        except (Forbidden, BadRequest):
-            forget_group(int(gid))
-        except Exception as e:
-            log.warning("Could not verify group %s: %s", gid, e)
+        except Exception:
+            pass
 
-    await asyncio.gather(*(verify(gid) for gid in list(GROUPS)))   # all groups checked in parallel
-    log.info("Groups loaded: %d | Users with access: %d", len(GROUPS), len(AUTH_IDS))
+
+def install_global_hooks(loop):
+    """Catches crashes outside handlers: main thread, other threads, asyncio loop."""
+    def _sys_hook(exc_type, exc, tb):
+        log.critical("Uncaught exception", exc_info=(exc_type, exc, tb))
+
+    def _thread_hook(args):
+        log.critical("Thread crash in %s", args.thread.name,
+                     exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    def _loop_hook(lp, ctx):
+        log.error("Asyncio error: %s", ctx.get("message"), exc_info=ctx.get("exception"))
+
+    sys.excepthook = _sys_hook
+    threading.excepthook = _thread_hook
+    loop.set_exception_handler(_loop_hook)
+
+
+# ---------------------------------------------------------------- startup / shutdown
+async def post_init(app: Application):
+    """After every restart: restore from Telegram backup if needed, re-verify groups, start backup loop."""
+    global BACKUP_OK
+    BACKUP_OK = await restore_from_telegram(app.bot)
+
+    await asyncio.gather(*(verify_group(app.bot, gid) for gid in list(GROUPS)))   # parallel
+    log.info("Groups loaded: %d | Users with access: %d | Data file: %s", len(GROUPS), len(AUTH_IDS), DATA_FILE)
+
+    if BACKUP_OK:
+        app.bot_data["backup_task"] = asyncio.create_task(backup_loop(app))
+        DIRTY.set()
+    else:
+        log.warning("Telegram backup disabled for this run (could not read owner chat)")
+
     try:
+        extra = "\n♻️ Data Telegram backup se restore hua." if RESTORED else ""
         await app.bot.send_message(
-            OWNER_ID, f"✅ Bot online. Remembered groups: {len(GROUPS)}\nSend /start for the guide."
+            OWNER_ID, f"✅ Bot online. Remembered groups: {len(GROUPS)}{extra}\nSend /start for the guide."
         )
     except Exception as e:
         log.warning("Could not DM owner on startup (press Start on the bot first): %s", e)
+
+
+async def post_shutdown(app: Application):
+    t = app.bot_data.get("backup_task")
+    if t:
+        t.cancel()
 
 
 # ---------------------------------------------------------------- flask health
@@ -686,14 +937,13 @@ def run_web():
     web.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False, threaded=True)
 
 
-# ---------------------------------------------------------------- main
-def main():
-    threading.Thread(target=run_web, daemon=True).start()
-
+# ---------------------------------------------------------------- app + main
+def build_app() -> Application:
     app = (
         Application.builder()
         .token(BOT_TOKEN)
         .post_init(post_init)
+        .post_shutdown(post_shutdown)
         .concurrent_updates(True)
         .connection_pool_size(32)
         .pool_timeout(5.0)
@@ -706,6 +956,7 @@ def main():
     app.add_handler(CommandHandler("start", cmd_start, filters=AUTH_DM))
     app.add_handler(CommandHandler("groups", cmd_groups, filters=AUTH_DM))
     app.add_handler(CommandHandler("rgroup", cmd_rgroup, filters=AUTH_DM))
+    app.add_handler(CommandHandler("sync", cmd_sync, filters=AUTH_DM))
     app.add_handler(CommandHandler("g", cmd_g, filters=AUTH_DM))
     app.add_handler(CommandHandler("target", cmd_target, filters=AUTH_DM))
     app.add_handler(CommandHandler("untarget", cmd_untarget, filters=AUTH_DM))
@@ -723,17 +974,36 @@ def main():
         MessageHandler(filters.ChatType.GROUPS & (filters.TEXT | filters.CAPTION), on_group_message)
     )
     app.add_error_handler(on_error)
+    return app
 
-    # Python 3.14 fix: polling needs an event loop in the main thread
-    asyncio.set_event_loop(asyncio.new_event_loop())
 
-    log.info("Bot started.")
-    app.run_polling(
-        allowed_updates=["message", "my_chat_member", "callback_query"],
-        drop_pending_updates=True,
-        poll_interval=0.0,
-        timeout=30,
-    )
+def main():
+    threading.Thread(target=run_web, daemon=True).start()
+
+    delay = 3
+    while True:
+        # Python 3.14 fix: polling needs an event loop in the main thread
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        install_global_hooks(loop)
+        try:
+            log.info("Bot started.")
+            build_app().run_polling(
+                allowed_updates=["message", "my_chat_member", "callback_query"],
+                drop_pending_updates=False,   # keep Telegram's queued updates so missed groups are discovered
+                poll_interval=0.0,
+                timeout=30,
+            )
+            break  # clean shutdown (SIGTERM / Ctrl+C)
+        except Exception as e:
+            log.critical("Polling crashed: %s. Restarting in %ss", e, delay, exc_info=True)
+            time.sleep(delay)
+            delay = min(delay * 2, 60)
+        finally:
+            try:
+                loop.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
